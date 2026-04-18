@@ -276,14 +276,18 @@ def extract_and_save_memory():
     summary_prompt = f"Analyze this chat log between Arpita and Shahidul. Extract the 3 most important new facts, emotional shifts, or tech projects (like his React/GSAP work) discussed. Format as a simple JSON array of strings. Log: {raw_history}"
     
     print(f"[SYSTEM] Extracting daily memories...")
-    memory_extraction = flash_model.generate_content(summary_prompt)
+    memory_extraction = flash_model.generate_content(
+        summary_prompt,
+        generation_config={"response_mime_type": "application/json"}
+    )
     
     # 3. Append to long-term memory
-    new_memories = memory_extraction.text.replace('```json\n', '').replace('```', '').strip()
     try:
-        memory_state['recent_events'].extend(json.loads(new_memories))
-        save_state("arpita_memory.json", memory_state)
-        print(f"[SYSTEM] Memories successfully burned to JSON.")
+        new_memories = json.loads(memory_extraction.text)
+        if new_memories:
+            memory_state['recent_events'].extend(new_memories)
+            save_state("arpita_memory.json", memory_state)
+            print(f"[SYSTEM] Memories successfully burned to JSON.")
     except Exception as e:
         print(f"[SYSTEM] Memory parsing failed today: {e}")
 
@@ -328,4 +332,9 @@ async def main_loop():
             print(f"\n[ERROR]: {e}\n")
 
 if __name__ == "__main__":
-    asyncio.run(main_loop())
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        print("\n[SYSTEM] Force quit detected.")
+        extract_and_save_memory()
+        print("[SYSTEM] Graceful shutdown complete.\n")
