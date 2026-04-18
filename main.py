@@ -5,7 +5,7 @@ import asyncio
 import tempfile
 import time
 import cv2
-import edge_tts
+import wave
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from dotenv import load_dotenv
@@ -99,11 +99,14 @@ brain_model = genai.GenerativeModel(
 chat_session = brain_model.start_chat(history=[])
 
 # Agent B: The Web Searcher & Summarizer (Gemini 2.5 Flash)
-# Flash has native search grounding and is fast enough to process vision/memory
-flash_model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
-    tools="google_search_retrieval" 
-)
+# Temporarily disabled to bypass SDK tool validation crash
+# flash_model = genai.GenerativeModel(
+#     model_name="gemini-2.5-flash",
+#     tools="google_search" 
+# )
+
+# Agent C: The Voicebox (Gemini Flash configured for Audio Out)
+voice_agent = genai.GenerativeModel("gemini-3.1-flash-tts-preview")
 
 def _looks_like_meta_line(line):
     normalized = line.strip().lower()
@@ -180,7 +183,8 @@ def play_audio_blocking(audio_path):
     if vlc is None:
         raise RuntimeError("python-vlc is not installed")
 
-    instance = vlc.Instance("--quiet")
+    # Removed --quiet to expose VLC errors
+    instance = vlc.Instance()
     player = instance.media_player_new()
     media = instance.media_new(audio_path)
     player.set_media(media)
@@ -198,24 +202,46 @@ def play_audio_blocking(audio_path):
     player.stop()
 
 async def speak_text(text):
-    """Generate TTS audio and play it without blocking the main loop."""
+    """Diagnostic TTS: Saves a permanent local WAV file and logs byte size."""
     if not text or not text.strip():
         return
 
-    temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-    temp_audio_path = temp_audio.name
-    temp_audio.close()
+    audio_path = "debug_voice.wav"
 
     try:
-        communicator = edge_tts.Communicate(text=text, voice=TTS_VOICE)
-        await communicator.save(temp_audio_path)
+        # Ask Gemini to speak the text
+        response = await asyncio.to_thread(
+            voice_agent.generate_content,
+            text,
+            generation_config={
+                "response_modalities": ["AUDIO"],
+                "speech_config": {
+                    "voice_config": {
+                        "prebuilt_voice_config": {
+                            "voice_name": "Aoede" 
+                        }
+                    }
+                }
+            }
+        )
+        
+        # Extract and log byte size
+        audio_bytes = response.candidates[0].content.parts[0].inline_data.data
+        print(f"[SYSTEM DEBUG] Audio generated successfully. Size: {len(audio_bytes)} bytes.")
+        
+        # Package raw PCM into a valid WAV container
+        with wave.open(audio_path, "wb") as wav_file:
+            wav_file.setnchannels(1)       # Mono
+            wav_file.setsampwidth(2)       # 16-bit resolution
+            wav_file.setframerate(24000)   # Gemini native sample rate
+            wav_file.writeframes(audio_bytes)
+            
+        # Play the file
         async with tts_playback_lock:
-            await asyncio.to_thread(play_audio_blocking, temp_audio_path)
-    except Exception as tts_error:
-        print(f"[TTS ERROR]: {tts_error}")
-    finally:
-        if os.path.exists(temp_audio_path):
-            os.remove(temp_audio_path)
+            await asyncio.to_thread(play_audio_blocking, audio_path)
+            
+    except Exception as audio_error:
+        print(f"[AUDIO ERROR]: {audio_error}")
 
 async def send_chat_message(message, enforce_output_contract=True):
     """Send a message to the shared chat session without concurrent races."""
@@ -252,8 +278,8 @@ async def vision_scanner():
             cv2.imwrite("temp_vision.jpg", frame)
             img_file = genai.upload_file("temp_vision.jpg")
             
-            # Ask Flash to describe the image
-            vision_context = flash_model.generate_content([img_file, "Describe what the user is doing in 10 words. Keep it literal."])
+            # Ask Brain Model to describe the image (Vision capabilities routing)
+            vision_context = brain_model.generate_content([img_file, "Describe what the user is doing in 10 words. Keep it literal."])
             
             # Secretly feed this context to Gemma 4 so she "knows" what she sees
             await send_chat_message(
@@ -276,7 +302,7 @@ def extract_and_save_memory():
     summary_prompt = f"Analyze this chat log between Arpita and Shahidul. Extract the 3 most important new facts, emotional shifts, or tech projects (like his React/GSAP work) discussed. Format as a simple JSON array of strings. Log: {raw_history}"
     
     print(f"[SYSTEM] Extracting daily memories...")
-    memory_extraction = flash_model.generate_content(
+    memory_extraction = brain_model.generate_content(
         summary_prompt,
         generation_config={"response_mime_type": "application/json"}
     )
@@ -309,19 +335,8 @@ async def main_loop():
                 print(f"[SYSTEM] Disconnected.\n")
                 break
             
-            # Intercept web search requests (Dynamic Routing)
-            if "search" in user_input.lower() or "look up" in user_input.lower():
-                print(f"[SYSTEM] Routing query through Flash Search Agent...")
-                search_data = await asyncio.to_thread(
-                    flash_model.generate_content,
-                    f"Use Google Search to answer this accurately: {user_input}"
-                )
-                # Feed the facts back to Gemma 4 to answer in character
-                system_injection = f"[SYSTEM FACTS FOUND: {search_data.text}]. Answer the user's prompt using these facts, but stay entirely in your persona."
-                response = await send_chat_message(user_input + "\n" + system_injection)
-            else:
-                # Normal, raw conversation
-                response = await send_chat_message(user_input)
+            # Normal, raw conversation (Search routing temporarily disabled)
+            response = await send_chat_message(user_input)
             
             spoken_text = clean_dialogue_output(response.text)
             # Speak in the background so terminal input is immediately available.
