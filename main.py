@@ -1,16 +1,22 @@
 import os
 import json
+import re
 import asyncio
 import tempfile
+import time
 import cv2
 import edge_tts
 import google.generativeai as genai
-import pygame
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from dotenv import load_dotenv
 
+try:
+    import vlc
+except Exception:
+    vlc = None
+
 # Install TTS dependencies before running:
-# pip install edge-tts pygame
+# pip install edge-tts python-vlc
 
 # --- 1. CONFIGURATION & STATE ---
 load_dotenv()
@@ -31,6 +37,48 @@ TTS_VOICE = os.getenv("ARPITA_TTS_VOICE", "en-US-JennyNeural")
 tts_playback_lock = asyncio.Lock()
 chat_session_lock = asyncio.Lock()
 
+_META_LINE_PREFIXES = (
+    "*",
+    "-",
+    "•",
+)
+_META_LINE_KEYWORDS = (
+    "role:",
+    "personality:",
+    "constraint:",
+    "context:",
+    "option",
+    "internal thought",
+    "reasoning",
+    "meta-commentary",
+)
+_META_SENTENCE_PATTERNS = (
+    r"\bthe user (?:is|asked|wants|said)\b",
+    r"\baccording to\b",
+    r"\bas per\b",
+    r"\b(?:i|we) need to\b",
+    r"\b(?:i|we) can\b.*\b(?:respond|answer|say|reply)\b",
+    r"\b(?:i|we) should\b",
+    r"\b(?:i|we) must\b.*\b(?:respond|answer|output|say)\b",
+    r"\b(?:my|the) (?:response|reply)\b",
+    r"\bpersona\b",
+    r"\bsystem (?:identity|prompt|instruction)\b",
+    r"\bkeep internal thoughts\b",
+    r"\bno meta-commentary\b",
+    r"\bbullet points?\b",
+    r"\bmust not\b",
+    r"\bplan:\b",
+    r"\baction:\b",
+)
+
+OUTPUT_CONTRACT = (
+    "[CRITICAL SYSTEM COMMAND: You are connected to a live Text-to-Speech engine. "
+    "Return your spoken response inside <speak> and </speak> tags only. "
+    "If you need to analyze, define a plan, or process internal thoughts, wrap that text entirely inside <think> and </think> tags. "
+    "Never place planning text outside <think>. Never place spoken dialogue outside <speak>. "
+    "Do not output words like 'Plan:' or 'Action:' outside <think>.]"
+)
+
 # The Unfiltered Override
 safety_overrides = {
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
@@ -44,7 +92,7 @@ safety_overrides = {
 # Agent A: The Core Brain (Gemma 4)
 system_prompt = f"IDENTITY: {core_state['identity']}\nLONG-TERM MEMORY: {json.dumps(memory_state)}\nMOOD: {core_state['base_mood']}"
 brain_model = genai.GenerativeModel(
-    model_name="gemma-4-31b",
+    model_name="models/gemma-4-31b-it",
     system_instruction=system_prompt,
     safety_settings=safety_overrides
 )
@@ -54,18 +102,100 @@ chat_session = brain_model.start_chat(history=[])
 # Flash has native search grounding and is fast enough to process vision/memory
 flash_model = genai.GenerativeModel(
     model_name="gemini-2.5-flash",
-    tools=[{"googleSearch": {}}] 
+    tools="google_search_retrieval" 
 )
 
+def _looks_like_meta_line(line):
+    normalized = line.strip().lower()
+    normalized = re.sub(r"^[`\s]+", "", normalized)
+    if not normalized:
+        return True
+    if normalized.startswith(_META_LINE_PREFIXES):
+        return True
+    if normalized[:2].isdigit() and normalized[2:3] in {".", ")"}:
+        return True
+    return any(keyword in normalized for keyword in _META_LINE_KEYWORDS)
+
+def _looks_like_meta_sentence(sentence):
+    normalized = sentence.strip().lower()
+    if not normalized:
+        return True
+    return any(re.search(pattern, normalized) for pattern in _META_SENTENCE_PATTERNS)
+
+def clean_dialogue_output(raw_text):
+    """Remove planning/meta traces and keep only final spoken dialogue."""
+    if not raw_text:
+        return ""
+
+    # Normalize occasional markdown wrappers that can break tag parsing.
+    normalized_text = raw_text.replace("`", "")
+
+    # Prefer explicit spoken channel, including malformed <speak outputs.
+    speak_start_matches = list(re.finditer(r"<\s*speak\b\s*>?", normalized_text, flags=re.DOTALL | re.IGNORECASE))
+    if speak_start_matches:
+        tail = normalized_text[speak_start_matches[-1].end():]
+        tail = re.sub(r"</\s*speak\s*>", "", tail, flags=re.DOTALL | re.IGNORECASE)
+        tail = tail.strip()
+        first_spoken_line = next((ln.strip() for ln in tail.splitlines() if ln.strip()), "")
+        if first_spoken_line:
+            cleaned_line = re.sub(r"</?\w+[^>]*>", "", first_spoken_line)
+            cleaned_line = re.sub(r'^[*\-\s"\']+', '', cleaned_line).strip()
+            if cleaned_line:
+                return cleaned_line
+        
+    # Strip out anything inside <think> tags (including the tags themselves)
+    raw_text = re.sub(r'<think>.*?(?:</think>|$)', '', normalized_text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+
+    filtered = [line for line in lines if not _looks_like_meta_line(line)]
+    if not filtered:
+        return lines[-1]
+
+    # If reasoning and dialogue are mixed on one line, drop only reasoning sentences.
+    merged = " ".join(filtered)
+    merged = re.sub(r"\b(?:arpita|assistant)\s*:\s*", "", merged, flags=re.IGNORECASE)
+    sentence_candidates = [s.strip() for s in re.split(r"(?<=[.!?])\s+", merged) if s.strip()]
+    spoken_sentences = [s for s in sentence_candidates if not _looks_like_meta_sentence(s)]
+    if spoken_sentences:
+        return spoken_sentences[-1].strip()
+
+    # Prefer the final natural line, but preserve short multi-line dialogue blocks.
+    dialogue_tail = []
+    for line in reversed(filtered):
+        if _looks_like_meta_line(line):
+            break
+        dialogue_tail.append(line)
+        if len(dialogue_tail) >= 3:
+            break
+
+    if dialogue_tail:
+        return " ".join(reversed(dialogue_tail)).strip()
+    return filtered[-1]
+
 def play_audio_blocking(audio_path):
-    """Play a local audio file to completion on a background thread."""
-    if not pygame.mixer.get_init():
-        pygame.mixer.init()
-    pygame.mixer.music.load(audio_path)
-    pygame.mixer.music.play()
-    while pygame.mixer.music.get_busy():
-        pygame.time.Clock().tick(10)
-    pygame.mixer.music.unload()
+    """Play audio using VLC."""
+    if vlc is None:
+        raise RuntimeError("python-vlc is not installed")
+
+    instance = vlc.Instance("--quiet")
+    player = instance.media_player_new()
+    media = instance.media_new(audio_path)
+    player.set_media(media)
+    player.play()
+
+    # Give VLC half a second to buffer and transition out of the initial Stopped state
+    time.sleep(0.5) 
+
+    while True:
+        state = player.get_state()
+        if state in {vlc.State.Ended, vlc.State.Error, vlc.State.Stopped}:
+            break
+        time.sleep(0.1)
+
+    player.stop()
 
 async def speak_text(text):
     """Generate TTS audio and play it without blocking the main loop."""
@@ -87,10 +217,14 @@ async def speak_text(text):
         if os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
 
-async def send_chat_message(message):
+async def send_chat_message(message, enforce_output_contract=True):
     """Send a message to the shared chat session without concurrent races."""
+    payload = message
+    if enforce_output_contract:
+        payload = f"{message}\n{OUTPUT_CONTRACT}"
+
     async with chat_session_lock:
-        return await asyncio.to_thread(chat_session.send_message, message)
+        return await asyncio.to_thread(chat_session.send_message, payload)
 
 # --- 3. THE "ALIVE" MECHANICS (ASYNC THREADS) ---
 
@@ -103,8 +237,9 @@ async def proactive_loop():
         response = await send_chat_message(
             "[SYSTEM COMMAND: The user has been quiet for 4 hours. Send a short, unprompted text asking what they are working on.]"
         )
-        asyncio.create_task(speak_text(response.text))
-        print(f"\nArpita (Unprompted): {response.text}\nYou: ", end="", flush=True)
+        spoken_text = clean_dialogue_output(response.text)
+        asyncio.create_task(speak_text(spoken_text))
+        print(f"\nArpita (Unprompted): {spoken_text}\nYou: ", end="", flush=True)
 
 async def vision_scanner():
     """Background thread: Grabs a webcam frame, asks Flash what you are doing, injects into memory."""
@@ -121,7 +256,10 @@ async def vision_scanner():
             vision_context = flash_model.generate_content([img_file, "Describe what the user is doing in 10 words. Keep it literal."])
             
             # Secretly feed this context to Gemma 4 so she "knows" what she sees
-            await send_chat_message(f"[SYSTEM VISION SENSOR UPDATE: User is currently doing this: {vision_context.text}. Do not reply to this message, just keep it in context.]")
+            await send_chat_message(
+                f"[SYSTEM VISION SENSOR UPDATE: User is currently doing this: {vision_context.text}. Do not reply to this message, just keep it in context.]",
+                enforce_output_contract=False,
+            )
             
             genai.delete_file(img_file.name)
             os.remove("temp_vision.jpg")
@@ -181,9 +319,10 @@ async def main_loop():
                 # Normal, raw conversation
                 response = await send_chat_message(user_input)
             
+            spoken_text = clean_dialogue_output(response.text)
             # Speak in the background so terminal input is immediately available.
-            asyncio.create_task(speak_text(response.text))
-            print(f"\nArpita: {response.text}\n")
+            asyncio.create_task(speak_text(spoken_text))
+            print(f"\nArpita: {spoken_text}\n")
             
         except Exception as e:
             print(f"\n[ERROR]: {e}\n")
