@@ -6,6 +6,7 @@ import tempfile
 import time
 import cv2
 import wave
+import glob
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -90,7 +91,14 @@ safety_overrides = [
 # --- 2. MULTI-AGENT INITIALIZATION ---
 
 # Agent A: The Core Brain (Gemma 4)
-system_prompt = f"IDENTITY: {core_state['identity']}\nLONG-TERM MEMORY: {json.dumps(memory_state)}\nMOOD: {core_state['base_mood']}"
+system_prompt = (
+    f"IDENTITY: {core_state['identity']}\n"
+    f"LONG-TERM MEMORY: {json.dumps(memory_state)}\n"
+    f"MOOD: {core_state['base_mood']}\n"
+    f"NEW CAPABILITIES:\n"
+    f"1. On-Demand Camera: If the user wants to show you something, output EXACTLY <ACTION: CAMERA>.\n"
+    f"2. On-Demand Voice: You have a strict daily quota for your vocal cords. ONLY if the user explicitly asks you to speak, talk, read aloud, or use your voice, output EXACTLY the phrase <ACTION: SPEAK> anywhere in your response."
+)
 
 chat_session = client.chats.create(
     model="models/gemma-4-31b-it",
@@ -133,6 +141,8 @@ def clean_dialogue_output(raw_text):
 
     # Normalize occasional markdown wrappers that can break tag parsing.
     normalized_text = raw_text.replace("`", "")
+    normalized_text = normalized_text.replace("<ACTION: CAMERA>", "")
+    normalized_text = normalized_text.replace("<ACTION: SPEAK>", "")
 
     # Prefer explicit spoken channel, including malformed <speak outputs.
     speak_start_matches = list(re.finditer(r"<\s*speak\b\s*>?", normalized_text, flags=re.DOTALL | re.IGNORECASE))
@@ -210,7 +220,7 @@ async def speak_text(text):
         # Ask Gemini to speak the text
         response = await asyncio.to_thread(
             client.models.generate_content,
-            model="gemini-3.1-flash-tts-preview",
+            model="gemini-2.5-flash-preview-tts", # Corrected preview string
             contents=text,
             config=types.GenerateContentConfig(
                 response_modalities=["AUDIO"],
@@ -260,53 +270,6 @@ async def proactive_loop():
         asyncio.create_task(speak_text(spoken_text))
         print(f"\nArpita (Unprompted): {spoken_text}\nYou: ", end="", flush=True)
 
-async def vision_scanner():
-    """Background thread: Grabs a webcam frame, asks Flash Lite what you are doing, injects into memory."""
-    while True:
-        await asyncio.sleep(60) # Relax the polling rate to 60 seconds
-        
-        # 1. Open the camera stream temporarily
-        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-        
-        # 2. Warm up the wireless bridge (clear the initial black frames)
-        for _ in range(10):
-            cap.read()
-            
-        # 3. Capture the actual stabilized frame
-        ret, frame = cap.read()
-        
-        # 4. Turn off the camera immediately to save phone battery
-        cap.release()
-        
-        if ret:
-            cv2.imwrite("temp_vision.jpg", frame)
-            cv2.imwrite("debug_vision.jpg", frame) # Permanent copy for us to inspect
-            
-            try:
-                # Upload and analyze
-                uploaded_file = client.files.upload(file="temp_vision.jpg")
-                vision_context = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model="gemini-3.1-flash-lite-preview",
-                    contents=[uploaded_file, "Describe what the user is doing in 10 words. Keep it literal."]
-                )
-                
-                # Feed the context
-                await send_chat_message(
-                    f"[SYSTEM VISION SENSOR UPDATE: User is currently doing this: {vision_context.text}. Do not reply to this message, just keep it in context.]",
-                    enforce_output_contract=False,
-                )
-                
-                # Cleanup cloud file
-                client.files.delete(name=uploaded_file.name)
-                
-            except Exception as e:
-                print(f"\n[SYSTEM] Vision sensor skipped a frame (API overloaded).")
-                
-            finally:
-                if os.path.exists("temp_vision.jpg"):
-                    os.remove("temp_vision.jpg")
-
 # --- 4. MEMORY MATURATION (THE SLEEP CYCLE) ---
 
 def extract_and_save_memory():
@@ -342,7 +305,6 @@ async def main_loop():
     
     # Start the background threads
     asyncio.create_task(proactive_loop())
-    asyncio.create_task(vision_scanner()) # Uncomment this when you are ready to turn the webcam on
     
     while True:
         try:
@@ -371,9 +333,54 @@ async def main_loop():
                 # Normal, raw conversation
                 response = await send_chat_message(user_input)
             
+            # The Native Camera Interceptor
+            if "<ACTION: CAMERA>" in response.text:
+                # 1. Speak her initial agreement ONLY if triggered
+                initial_text = clean_dialogue_output(response.text)
+                print(f"\nArpita: {initial_text}")
+                if "<ACTION: SPEAK>" in response.text:
+                    asyncio.create_task(speak_text(initial_text))
+                
+                print("\n[SYSTEM] Arpita triggered the optic nerve. Opening Windows Camera...")
+                # Launch native Windows Camera App
+                os.system('start microsoft.windows.camera:')
+                
+                # Wait for the user to take the shot
+                input("[SYSTEM] Take the picture in the Camera App, then press ENTER here to let her see it...")
+                
+                # Find the newest photo in the Windows Camera Roll
+                camera_roll_path = os.path.expanduser('~\\Pictures\\Camera Roll\\*.*')
+                valid_extensions = ('.jpg', '.jpeg', '.png')
+                files = [f for f in glob.glob(camera_roll_path) if f.lower().endswith(valid_extensions)]
+                
+                if files:
+                    latest_pic = max(files, key=os.path.getctime)
+                    print(f"[SYSTEM] Processing {os.path.basename(latest_pic)} through Gemma 3 12B Vision...")
+                    
+                    try:
+                        uploaded_file = client.files.upload(file=latest_pic)
+                        vision_context = await asyncio.to_thread(
+                            client.models.generate_content,
+                            model="gemma-3-12b-it",
+                            contents=[uploaded_file, "Describe exactly what the user is showing you. Be highly detailed. If there is text or handwriting, you must read it."],
+                            config=types.GenerateContentConfig(safety_settings=safety_overrides)
+                        )
+                        client.files.delete(name=uploaded_file.name)
+                        
+                        # 2. Feed the image data and OVERWRITE the response variable
+                        response = await send_chat_message(
+                            f"[SYSTEM VISION UPDATE: The user just showed you this: {vision_context.text}. React to it naturally in character.]", 
+                            enforce_output_contract=True
+                        )
+                    except Exception as e:
+                        print(f"[SYSTEM] Vision processing failed: {e}")
+                else:
+                    print("[SYSTEM] No pictures found in Camera Roll. Skipping vision update.")
+
             spoken_text = clean_dialogue_output(response.text)
-            # Speak in the background so terminal input is immediately available.
-            asyncio.create_task(speak_text(spoken_text))
+            # Only speak if the brain explicitly decided to use the vocal cords
+            if "<ACTION: SPEAK>" in response.text:
+                asyncio.create_task(speak_text(spoken_text))
             print(f"\nArpita: {spoken_text}\n")
             
         except Exception as e:
