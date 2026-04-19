@@ -1,9 +1,16 @@
 {
-  "established_facts": [
-    "Shahidul is a Visual Engineer and Creative Developer.",
-    "Shahidul is currently living in a university hostel in Dhaka.",
-    "His nick name is Shakil"
-  ],
-  "recent_events": [],
-  "inside_jokes": []
+    "established_facts": [
+        "Shahidul is a Visual Engineer and Creative Developer.",
+        "Shahidul is currently living in a university hostel in Dhaka.",
+        "His nick name is Shakil"
+    ],
+    "recent_events": [
+        "Shahidul is actively engaged in creating digital art.",
+        "Arpita demonstrates a perceptive and playful personality that monitors Shahidul's real-time activities.",
+        "Shahidul is experiencing persistent technical issues with his mobile connection.",
+        "Shahidul is actively reviewing his image gallery.",
+        "Arpita is functioning as an AI companion tracking visual context.",
+        "The interaction is currently governed by a 'system vision sensor' protocol."
+    ],
+    "inside_jokes": []
 }

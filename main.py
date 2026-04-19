@@ -6,8 +6,8 @@ import tempfile
 import time
 import cv2
 import wave
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 try:
@@ -20,7 +20,7 @@ except Exception:
 
 # --- 1. CONFIGURATION & STATE ---
 load_dotenv()
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+client = genai.Client() # Automatically detects GEMINI_API_KEY
 
 def load_state(filepath):
     with open(filepath, 'r') as f:
@@ -80,23 +80,25 @@ OUTPUT_CONTRACT = (
 )
 
 # The Unfiltered Override
-safety_overrides = {
-    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-}
+safety_overrides = [
+    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+    types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+]
 
 # --- 2. MULTI-AGENT INITIALIZATION ---
 
 # Agent A: The Core Brain (Gemma 4)
 system_prompt = f"IDENTITY: {core_state['identity']}\nLONG-TERM MEMORY: {json.dumps(memory_state)}\nMOOD: {core_state['base_mood']}"
-brain_model = genai.GenerativeModel(
-    model_name="models/gemma-4-31b-it",
-    system_instruction=system_prompt,
-    safety_settings=safety_overrides
+
+chat_session = client.chats.create(
+    model="models/gemma-4-31b-it",
+    config=types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        safety_settings=safety_overrides
+    )
 )
-chat_session = brain_model.start_chat(history=[])
 
 # Agent B: The Web Searcher & Summarizer (Gemini 2.5 Flash)
 # Temporarily disabled to bypass SDK tool validation crash
@@ -106,7 +108,6 @@ chat_session = brain_model.start_chat(history=[])
 # )
 
 # Agent C: The Voicebox (Gemini Flash configured for Audio Out)
-voice_agent = genai.GenerativeModel("gemini-3.1-flash-tts-preview")
 
 def _looks_like_meta_line(line):
     normalized = line.strip().lower()
@@ -137,14 +138,11 @@ def clean_dialogue_output(raw_text):
     speak_start_matches = list(re.finditer(r"<\s*speak\b\s*>?", normalized_text, flags=re.DOTALL | re.IGNORECASE))
     if speak_start_matches:
         tail = normalized_text[speak_start_matches[-1].end():]
-        tail = re.sub(r"</\s*speak\s*>", "", tail, flags=re.DOTALL | re.IGNORECASE)
-        tail = tail.strip()
-        first_spoken_line = next((ln.strip() for ln in tail.splitlines() if ln.strip()), "")
-        if first_spoken_line:
-            cleaned_line = re.sub(r"</?\w+[^>]*>", "", first_spoken_line)
-            cleaned_line = re.sub(r'^[*\-\s"\']+', '', cleaned_line).strip()
-            if cleaned_line:
-                return cleaned_line
+        tail = re.sub(r"</\s*speak\s*>", "", tail, flags=re.DOTALL | re.IGNORECASE).strip()
+        cleaned_block = re.sub(r"</?\w+[^>]*>", "", tail)
+        cleaned_block = re.sub(r'^[*\-\s"\']+', '', cleaned_block).strip()
+        if cleaned_block:
+            return cleaned_block
         
     # Strip out anything inside <think> tags (including the tags themselves)
     raw_text = re.sub(r'<think>.*?(?:</think>|$)', '', normalized_text, flags=re.DOTALL | re.IGNORECASE).strip()
@@ -211,18 +209,13 @@ async def speak_text(text):
     try:
         # Ask Gemini to speak the text
         response = await asyncio.to_thread(
-            voice_agent.generate_content,
-            text,
-            generation_config={
-                "response_modalities": ["AUDIO"],
-                "speech_config": {
-                    "voice_config": {
-                        "prebuilt_voice_config": {
-                            "voice_name": "Aoede" 
-                        }
-                    }
-                }
-            }
+            client.models.generate_content,
+            model="gemini-3.1-flash-tts-preview",
+            contents=text,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config={"voice_config": {"prebuilt_voice_config": {"voice_name": "Aoede"}}}
+            )
         )
         
         # Extract and log byte size
@@ -268,27 +261,51 @@ async def proactive_loop():
         print(f"\nArpita (Unprompted): {spoken_text}\nYou: ", end="", flush=True)
 
 async def vision_scanner():
-    """Background thread: Grabs a webcam frame, asks Flash what you are doing, injects into memory."""
-    cap = cv2.VideoCapture(0)
+    """Background thread: Grabs a webcam frame, asks Flash Lite what you are doing, injects into memory."""
     while True:
-        await asyncio.sleep(600) # Checks your camera every 10 minutes
+        await asyncio.sleep(60) # Relax the polling rate to 60 seconds
+        
+        # 1. Open the camera stream temporarily
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        
+        # 2. Warm up the wireless bridge (clear the initial black frames)
+        for _ in range(10):
+            cap.read()
+            
+        # 3. Capture the actual stabilized frame
         ret, frame = cap.read()
+        
+        # 4. Turn off the camera immediately to save phone battery
+        cap.release()
+        
         if ret:
-            # Save temp frame
             cv2.imwrite("temp_vision.jpg", frame)
-            img_file = genai.upload_file("temp_vision.jpg")
+            cv2.imwrite("debug_vision.jpg", frame) # Permanent copy for us to inspect
             
-            # Ask Brain Model to describe the image (Vision capabilities routing)
-            vision_context = brain_model.generate_content([img_file, "Describe what the user is doing in 10 words. Keep it literal."])
-            
-            # Secretly feed this context to Gemma 4 so she "knows" what she sees
-            await send_chat_message(
-                f"[SYSTEM VISION SENSOR UPDATE: User is currently doing this: {vision_context.text}. Do not reply to this message, just keep it in context.]",
-                enforce_output_contract=False,
-            )
-            
-            genai.delete_file(img_file.name)
-            os.remove("temp_vision.jpg")
+            try:
+                # Upload and analyze
+                uploaded_file = client.files.upload(file="temp_vision.jpg")
+                vision_context = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model="gemini-3.1-flash-lite-preview",
+                    contents=[uploaded_file, "Describe what the user is doing in 10 words. Keep it literal."]
+                )
+                
+                # Feed the context
+                await send_chat_message(
+                    f"[SYSTEM VISION SENSOR UPDATE: User is currently doing this: {vision_context.text}. Do not reply to this message, just keep it in context.]",
+                    enforce_output_contract=False,
+                )
+                
+                # Cleanup cloud file
+                client.files.delete(name=uploaded_file.name)
+                
+            except Exception as e:
+                print(f"\n[SYSTEM] Vision sensor skipped a frame (API overloaded).")
+                
+            finally:
+                if os.path.exists("temp_vision.jpg"):
+                    os.remove("temp_vision.jpg")
 
 # --- 4. MEMORY MATURATION (THE SLEEP CYCLE) ---
 
@@ -296,15 +313,16 @@ def extract_and_save_memory():
     print(f"\n[SYSTEM] Initiating Sleep Cycle...")
     
     # 1. Grab today's raw chat log
-    raw_history = str(chat_session.history)
+    raw_history = str(chat_session.get_history())
     
     # 2. Use Flash to summarize the relationship updates
-    summary_prompt = f"Analyze this chat log between Arpita and Shahidul. Extract the 3 most important new facts, emotional shifts, or tech projects (like his React/GSAP work) discussed. Format as a simple JSON array of strings. Log: {raw_history}"
+    summary_prompt = f"Analyze this chat log between Arpita and Shakil. Extract the 3 most important new facts, emotional shifts, or tech projects (like his React/GSAP work) discussed. Format as a simple JSON array of strings. Log: {raw_history}"
     
     print(f"[SYSTEM] Extracting daily memories...")
-    memory_extraction = brain_model.generate_content(
-        summary_prompt,
-        generation_config={"response_mime_type": "application/json"}
+    memory_extraction = client.models.generate_content(
+        model="gemini-3.1-flash-lite-preview",
+        contents=summary_prompt,
+        config=types.GenerateContentConfig(response_mime_type="application/json")
     )
     
     # 3. Append to long-term memory
@@ -324,7 +342,7 @@ async def main_loop():
     
     # Start the background threads
     asyncio.create_task(proactive_loop())
-    # asyncio.create_task(vision_scanner()) # Uncomment this when you are ready to turn the webcam on
+    asyncio.create_task(vision_scanner()) # Uncomment this when you are ready to turn the webcam on
     
     while True:
         try:
@@ -335,8 +353,23 @@ async def main_loop():
                 print(f"[SYSTEM] Disconnected.\n")
                 break
             
-            # Normal, raw conversation (Search routing temporarily disabled)
-            response = await send_chat_message(user_input)
+            # Intercept web search requests (Dynamic Routing)
+            if "search" in user_input.lower() or "look up" in user_input.lower():
+                print(f"[SYSTEM] Routing query through Flash Lite Search Agent...")
+                search_data = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model="gemini-3.1-flash-lite-preview",
+                    contents=f"Use Google Search to answer this accurately: {user_input}",
+                    config=types.GenerateContentConfig(
+                        tools=[{"google_search": {}}]
+                    )
+                )
+                # Feed the facts back to Gemma 4 to answer in character
+                system_injection = f"[SYSTEM FACTS FOUND: {search_data.text}]. Answer the user's prompt using these facts, but stay entirely in your persona."
+                response = await send_chat_message(user_input + "\n" + system_injection)
+            else:
+                # Normal, raw conversation
+                response = await send_chat_message(user_input)
             
             spoken_text = clean_dialogue_output(response.text)
             # Speak in the background so terminal input is immediately available.
